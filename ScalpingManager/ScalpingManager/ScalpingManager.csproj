@@ -10,7 +10,7 @@
     <RootNamespace>ScalpingManager</RootNamespace>
     <StartAction>Program</StartAction>
     <StartProgram>C:\Quantower\TradingPlatform\v1.146.4\Console.StarterNew.exe</StartProgram>
-    <StartArguments>--address 127.0.0.1 --port 54322</StartArguments>
+    <StartArguments>--address 127.0.0.1 --port 61302</StartArguments>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
     <OutputPath>C:\Quantower\TradingPlatform\v1.146.4\..\..\Settings\Scripts\Strategies\ScalpingManager</OutputPath>
