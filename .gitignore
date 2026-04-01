@@ -1,0 +1,69 @@
+## --- [ Сборка и Артефакты ] ---
+[Bb]in/
+[Oo]bj/
+[Rr]elease/
+[Dd]ebug/
+x64/
+x86/
+[Aa]rm/
+[Aa]rm64/
+
+## --- [ Visual Studio ] ---
+.vs/
+*.user
+*.userosscache
+*.sln.docstates
+*.suo
+*.userprefs
+*.dbmdl
+*.jsproj.user
+*.sqlproj.user
+*.suo
+*.user
+
+## --- [ .NET / C# ] ---
+# Файлы свойств и настроек пользователя
+*.props.user
+*.targets.user
+# Сгенерированные файлы ресурсов
+*.designer.cs
+*.resx
+
+## --- [ Пакетные менеджеры ] ---
+# NuGet
+packages/
+*.nuget.props
+*.nuget.targets
+# Игнорируем пакеты, но НЕ global.json или пакетные конфиги
+!packages/repositories.config
+
+## --- [ Тестирование ] ---
+TestResults/
+*.sequenced
+/artifacts/
+
+## --- [ Секреты и Конфигурация ] ---
+# Никогда не пушьте файлы с паролями и токенами
+appsettings.Development.json
+appsettings.*.user.json
+secrets.json
+*.env
+*.pem
+*.pfx
+
+## --- [ Операционная система ] ---
+# Windows
+Thumbs.db
+ehthumbs.db
+desktop.ini
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+## --- [ Другое ] ---
+# Логи
+*.log
+# Директории инструментов (например, ReSharper)
+_ReSharper*/
+*.[Rr]e[Ss]harper.user
