@@ -1,23 +1,28 @@
-﻿// ═══════════════════════════════════════════════════════════════════
-// SafeTrailing v1.0
-// Задача: трейлинг SL для конкретного символа.
-// - Управляет ТОЛЬКО прибыльной позицией (pnl >= TrailTrigger %)
-// - Если позиция в убытке — не трогает SL
-// - Пользователь НЕ может перехватить управление (стратегия
-//   всегда восстанавливает SL согласно параметрам)
-// - Поддержка Hedge Mode: Long и Short независимо
-// - Имя экземпляра = Symbol автоматически
-// ═══════════════════════════════════════════════════════════════════
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using TradingPlatform.BusinessLayer;
 
 namespace SafeTrailing
 {
+    /// <summary>
+    /// SafeTrailing v1.1
+    ///
+    /// Исправления vs v1.0:
+    /// 1. Флаг _replacing блокирует CheckAndRestoreSL во время замены SL.
+    ///    Устраняет спам "Восстанавливаем SL" (сотни раз в секунду).
+    /// 2. Задержка 500ms между Cancel и PlaceOrder — Binance обрабатывает
+    ///    Cancel асинхронно, без паузы следующий Place получает -4130.
+    /// 3. SlPrice обновляется ТОЛЬКО после успешного PlaceOrder —
+    ///    восстановление всегда идёт на актуальную подтверждённую цену.
+    /// 4. TrailBestPrice обновляется только при успешном ReplaceSL —
+    ///    если Place упал с Failure, экстремум не сдвигается.
+    /// 5. Throttle вынесен на уровень тика (не внутри ReplaceSL) —
+    ///    предотвращает очередь из вызовов при быстром движении цены.
+    /// </summary>
     public class SafeTrailing : Strategy
     {
-        private const string VERSION = "v1.0";
+        private const string VERSION = "v1.1";
 
         // ── Параметры ──────────────────────────────────────────────────
         [InputParameter("Symbol", 10)]
@@ -32,16 +37,20 @@ namespace SafeTrailing
         [InputParameter("Trailing distance %", 40, 0.1, 20, 0.1, 1)]
         public double TrailDistPct = 1.0;
 
-        // ── Состояние одной управляемой позиции ───────────────────────
+        // ── Состояние позиции ──────────────────────────────────────────
         private class TrailedPos
         {
             public string PositionId;
-            public string SlOrderId;     // текущий SL ордер
-            public double SlPrice;       // последняя установленная цена SL
+            public string SlOrderId;       // актуальный ID SL на бирже
+            public double SlPrice;         // цена SL подтверждённая биржей
             public bool IsLong;
-            public double TrailBestPrice; // лучшая цена с момента активации
-            public bool TrailActive;   // трейлинг активен
-            public DateTime LastSlUpdate;  // throttle
+            public double TrailBestPrice;  // лучшая цена с момента активации
+            public bool TrailActive;
+            public DateTime LastSlUpdate;    // время последнего успешного ReplaceSL
+
+            // Флаг: идёт замена SL (Cancel+delay+Place).
+            // Пока true — CheckAndRestoreSL не вызывается.
+            public bool Replacing;
         }
 
         // Ключ — Position.Id (в Hedge Mode Long и Short имеют разные Id)
@@ -49,11 +58,11 @@ namespace SafeTrailing
 
         private StreamWriter _logFile;
 
-        // ── Конструктор — задаём имя; экземпляр будет назван по Symbol ─
+        // ── Конструктор ────────────────────────────────────────────────
         public SafeTrailing() : base()
         {
             this.Name = $"SafeTrailing {VERSION}";
-            this.Description = "Trailing SL for specific symbol. Hedge Mode compatible.";
+            this.Description = "Trailing SL for specific symbol. Hedge Mode. No manual override.";
         }
 
         // ── Запуск ─────────────────────────────────────────────────────
@@ -71,22 +80,20 @@ namespace SafeTrailing
                 InitLogFile();
                 _managed.Clear();
 
-                // Обновить имя экземпляра = символ (отображается в Strategy Manager)
+                // Имя экземпляра = символ (видно в Strategy Manager)
                 this.Name = $"SafeTrailing {symbol.Name} {VERSION}";
 
                 WriteLog($"[{VERSION}] ✅ SafeTrailing запущен");
                 WriteLog($"[{VERSION}] 📋 Symbol:{symbol.Name} | Account:{account.Name}");
-                WriteLog($"[{VERSION}] ⚙ Trail@{TrailTriggerPct}%±{TrailDistPct}%");
+                WriteLog($"[{VERSION}] ⚙ Trail@{TrailTriggerPct}% | Distance:{TrailDistPct}%");
 
                 // Подписаться на тики символа
                 symbol.NewLast += OnNewLast;
 
-                // Подхватить уже открытые позиции по символу
+                // Подхватить уже открытые позиции
                 foreach (var pos in Core.Instance.Positions)
-                {
                     if (pos.Account == account && pos.Symbol == symbol)
                         TryAttach(pos, "pre-existing");
-                }
 
                 Core.PositionAdded += OnPositionAdded;
                 Core.PositionRemoved += OnPositionRemoved;
@@ -103,18 +110,16 @@ namespace SafeTrailing
             Core.PositionAdded -= OnPositionAdded;
             Core.PositionRemoved -= OnPositionRemoved;
             if (symbol != null) symbol.NewLast -= OnNewLast;
-
             _managed.Clear();
             WriteLog($"[{VERSION}] ■ Остановлен.");
             CloseLogFile();
         }
 
-        // ── Подключить позицию к управлению ───────────────────────────
+        // ── Подключить позицию ─────────────────────────────────────────
         private void TryAttach(Position pos, string reason)
         {
             if (_managed.ContainsKey(pos.Id)) return;
 
-            // Найти существующий SL ордер для этой позиции
             var existingSl = FindExistingSlOrder(pos);
 
             var tp = new TrailedPos
@@ -124,8 +129,8 @@ namespace SafeTrailing
                 TrailBestPrice = pos.OpenPrice,
                 TrailActive = false,
                 LastSlUpdate = DateTime.MinValue,
-                // Если SL уже выставлен — запоминаем его
-                SlOrderId = existingSl?.Id,
+                Replacing = false,
+                SlOrderId = existingSl?.Id ?? string.Empty,
                 SlPrice = existingSl?.TriggerPrice ?? 0
             };
 
@@ -133,9 +138,9 @@ namespace SafeTrailing
 
             WriteLog($"[{VERSION}] 🔗 [{pos.Symbol.Name}] {pos.Side} подключена ({reason}) @ {pos.OpenPrice:F6} ID:{pos.Id}");
             if (existingSl != null)
-                WriteLog($"[{VERSION}] 📌 [{pos.Symbol.Name}] {pos.Side} существующий SL: {tp.SlPrice:F6} ID:{tp.SlOrderId}");
+                WriteLog($"[{VERSION}] 📌 [{pos.Symbol.Name}] {pos.Side} SL: {tp.SlPrice:F6} ID:{tp.SlOrderId}");
             else
-                WriteLog($"[{VERSION}] ℹ [{pos.Symbol.Name}] {pos.Side} SL не найден — будет выставлен при активации трейлинга.");
+                WriteLog($"[{VERSION}] ℹ [{pos.Symbol.Name}] {pos.Side} SL не найден — выставим при активации.");
         }
 
         // ── Новая позиция ──────────────────────────────────────────────
@@ -146,14 +151,10 @@ namespace SafeTrailing
                 if (pos.Account != account) return;
                 if (pos.Symbol != symbol) return;
                 if (_managed.ContainsKey(pos.Id)) return;
-
                 WriteLog($"[{VERSION}] 📥 Новая позиция: [{pos.Symbol.Name}] {pos.Side} @ {pos.OpenPrice:F6} ID:{pos.Id}");
                 TryAttach(pos, "new");
             }
-            catch (Exception ex)
-            {
-                WriteLog($"[{VERSION}] ❌ OnPositionAdded: {ex}");
-            }
+            catch (Exception ex) { WriteLog($"[{VERSION}] ❌ OnPositionAdded: {ex}"); }
         }
 
         // ── Позиция закрыта ────────────────────────────────────────────
@@ -163,23 +164,18 @@ namespace SafeTrailing
             {
                 if (!_managed.ContainsKey(pos.Id)) return;
                 _managed.Remove(pos.Id);
-                WriteLog($"[{VERSION}] ■ [{pos.Symbol.Name}] {pos.Side} закрыта — очищена. ID:{pos.Id}");
+                WriteLog($"[{VERSION}] ■ [{pos.Symbol.Name}] {pos.Side} закрыта. ID:{pos.Id}");
             }
-            catch (Exception ex)
-            {
-                WriteLog($"[{VERSION}] ❌ OnPositionRemoved: {ex}");
-            }
+            catch (Exception ex) { WriteLog($"[{VERSION}] ❌ OnPositionRemoved: {ex}"); }
         }
 
-        // ── Каждый тик символа ────────────────────────────────────────
+        // ── Каждый тик ────────────────────────────────────────────────
         private void OnNewLast(Symbol sym, Last last)
         {
             try
             {
                 double price = last.Price;
 
-                // Проходим по всем управляемым позициям
-                // В Hedge Mode их может быть 2 (Long + Short)
                 foreach (var pos in Core.Instance.Positions)
                 {
                     if (pos.Account != account) continue;
@@ -188,25 +184,28 @@ namespace SafeTrailing
 
                     var tp = _managed[pos.Id];
 
-                    // Рассчитать PnL позиции
+                    // Пока идёт замена SL — пропускаем тик полностью
+                    if (tp.Replacing) continue;
+
+                    // Throttle на уровне тика: не чаще раза в 300ms
+                    if ((DateTime.UtcNow - tp.LastSlUpdate).TotalMilliseconds < 300) continue;
+
                     double pnlPct = tp.IsLong
                         ? (price - pos.OpenPrice) / pos.OpenPrice * 100.0
                         : (pos.OpenPrice - price) / pos.OpenPrice * 100.0;
 
-                    // Позиция в убытке — не трогаем SL (пользователь управляет вручную)
+                    // Позиция в убытке — трейлинг не активен, SL не трогаем
                     if (pnlPct < 0)
                     {
                         if (tp.TrailActive)
                         {
-                            // Трейлинг был активен но цена ушла в минус
-                            // Оставляем последний SL на месте — не трогаем
-                            WriteLog($"[{VERSION}] ⚠ [{symbol.Name}] {pos.Side} PnL={pnlPct:F3}% — убыток, SL не двигаем.");
                             tp.TrailActive = false;
+                            WriteLog($"[{VERSION}] ⚠ [{symbol.Name}] {pos.Side} PnL={pnlPct:F3}% — убыток, трейлинг приостановлен.");
                         }
                         continue;
                     }
 
-                    // Активировать трейлинг при достижении триггера
+                    // Активировать трейлинг
                     if (!tp.TrailActive && pnlPct >= TrailTriggerPct)
                     {
                         tp.TrailActive = true;
@@ -216,44 +215,125 @@ namespace SafeTrailing
 
                     if (!tp.TrailActive) continue;
 
-                    // Обновить best price и двигать SL
                     bool newExtreme = tp.IsLong
                         ? price > tp.TrailBestPrice
                         : price < tp.TrailBestPrice;
 
                     if (newExtreme)
                     {
-                        tp.TrailBestPrice = price;
+                        // Цена обновила экстремум — двигаем SL
                         double newSl = RoundToTick(
                             CalcPrice(price, tp.IsLong, -TrailDistPct),
                             symbol.TickSize);
+
                         WriteLog($"[{VERSION}] 📈 [{symbol.Name}] {pos.Side} Trail: {price:F6} → SL={newSl:F6}");
-                        ReplaceSL(pos, tp, newSl);
+                        ReplaceSL(pos, tp, price, newSl);
                     }
                     else
                     {
-                        // Цена не обновила экстремум — проверяем не сдвинул ли
-                        // пользователь SL и восстанавливаем если нужно
+                        // Экстремум не обновился — проверяем целостность SL
+                        // CheckAndRestoreSL вызывается только если НЕ идёт замена
                         CheckAndRestoreSL(pos, tp);
                     }
                 }
             }
-            catch (Exception ex)
-            {
-                WriteLog($"[{VERSION}] ❌ OnNewLast: {ex}");
-            }
+            catch (Exception ex) { WriteLog($"[{VERSION}] ❌ OnNewLast: {ex}"); }
         }
 
-        // ── Проверить SL и восстановить если пользователь его изменил ─
-        // В отличие от SafeBreakeven — здесь пользователь НЕ может
-        // перехватить управление. Стратегия всегда восстанавливает SL.
+        // ── Заменить SL ────────────────────────────────────────────────
+        // Cancel + 500ms пауза + PlaceOrder.
+        // Пауза обязательна: Binance обрабатывает Cancel асинхронно,
+        // без паузы новый Place получает -4130 (ордер ещё существует).
+        private void ReplaceSL(Position pos, TrailedPos tp, double newBestPrice, double newSlPrice)
+        {
+            // Устанавливаем флаг — блокируем все тики пока не завершим
+            tp.Replacing = true;
+
+            System.Threading.Tasks.Task.Run(async () =>
+            {
+                try
+                {
+                    Side closeSide = tp.IsLong ? Side.Sell : Side.Buy;
+
+                    // Шаг 1: Отменить старый SL
+                    if (!string.IsNullOrEmpty(tp.SlOrderId))
+                    {
+                        var old = FindOrder(tp.SlOrderId);
+                        if (old != null)
+                        {
+                            WriteLog($"[{VERSION}] 📤 [{pos.Symbol.Name}] {pos.Side} Cancel SL ID:{tp.SlOrderId}");
+                            var cancelRes = old.Cancel();
+                            WriteLog($"[{VERSION}] 📨 [{pos.Symbol.Name}] {pos.Side} Cancel: {cancelRes.Status} {cancelRes.Message ?? "OK"}");
+                        }
+                        else
+                        {
+                            WriteLog($"[{VERSION}] ℹ [{pos.Symbol.Name}] {pos.Side} SL ID:{tp.SlOrderId} не найден (уже исполнен?).");
+                        }
+                    }
+
+                    // Шаг 2: Пауза — дать бирже время обработать Cancel
+                    await System.Threading.Tasks.Task.Delay(500);
+
+                    // Проверить что позиция ещё открыта
+                    if (!_managed.ContainsKey(pos.Id))
+                    {
+                        WriteLog($"[{VERSION}] ℹ [{pos.Symbol.Name}] {pos.Side} позиция закрыта во время замены SL — отмена.");
+                        return;
+                    }
+
+                    // Шаг 3: Выставить новый SL
+                    WriteLog($"[{VERSION}] 📤 [{pos.Symbol.Name}] {pos.Side} Place SL@{newSlPrice:F6}");
+                    var result = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
+                    {
+                        Symbol = pos.Symbol,
+                        Account = pos.Account,
+                        Side = closeSide,
+                        OrderTypeId = OrderType.Stop,
+                        TriggerPrice = newSlPrice,
+                        Quantity = pos.Quantity,
+                        TimeInForce = TimeInForce.GTC,
+                        PositionId = pos.Id
+                    });
+
+                    WriteLog($"[{VERSION}] 📨 [{pos.Symbol.Name}] {pos.Side} Place SL: {result.Status} {result.Message ?? "OK"} ID:{result.OrderId ?? "null"}");
+
+                    if (result.Status == TradingOperationResultStatus.Success)
+                    {
+                        // Обновляем состояние ТОЛЬКО при успехе
+                        tp.SlOrderId = result.OrderId;
+                        tp.SlPrice = newSlPrice;
+                        tp.TrailBestPrice = newBestPrice; // фиксируем новый экстремум
+                        tp.LastSlUpdate = DateTime.UtcNow;
+                        WriteLog($"[{VERSION}] ✅ [{pos.Symbol.Name}] {pos.Side} SL установлен: {newSlPrice:F6} ID:{tp.SlOrderId}");
+                    }
+                    else
+                    {
+                        // Place упал — оставляем SlPrice и TrailBestPrice без изменений
+                        // Следующий тик попробует снова
+                        WriteLog($"[{VERSION}] ❌ [{pos.Symbol.Name}] {pos.Side} Place SL ошибка: {result.Message}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    WriteLog($"[{VERSION}] ❌ ReplaceSL: {ex}");
+                }
+                finally
+                {
+                    // Снимаем флаг в любом случае — разблокируем тики
+                    tp.Replacing = false;
+                }
+            });
+        }
+
+        // ── Проверить и восстановить SL ───────────────────────────────
+        // Вызывается только когда цена не обновляет экстремум
+        // и флаг Replacing = false.
         private void CheckAndRestoreSL(Position pos, TrailedPos tp)
         {
+            // Нет данных о SL — нечего проверять
             if (string.IsNullOrEmpty(tp.SlOrderId) || tp.SlPrice <= 0) return;
 
             var slOrder = FindOrder(tp.SlOrderId);
-
-            // SL исчез или изменился — восстановить
             bool needRestore = false;
             string reason = "";
 
@@ -268,64 +348,18 @@ namespace SafeTrailing
                 if (Math.Abs(slOrder.TriggerPrice - tp.SlPrice) > tolerance)
                 {
                     needRestore = true;
-                    reason = $"SL изменён: {tp.SlPrice:F6}→{slOrder.TriggerPrice:F6}";
+                    reason = $"цена изменена: {tp.SlPrice:F6}→{slOrder.TriggerPrice:F6}";
                 }
             }
 
-            if (needRestore)
-            {
-                WriteLog($"[{VERSION}] 🔧 [{symbol.Name}] {pos.Side} Восстанавливаем SL ({reason}) → {tp.SlPrice:F6}");
-                ReplaceSL(pos, tp, tp.SlPrice);
-            }
+            if (!needRestore) return;
+
+            // Восстанавливаем на tp.SlPrice — последнюю успешно установленную цену
+            WriteLog($"[{VERSION}] 🔧 [{symbol.Name}] {pos.Side} Восстанавливаем SL ({reason}) → {tp.SlPrice:F6}");
+            ReplaceSL(pos, tp, tp.TrailBestPrice, tp.SlPrice);
         }
 
-        // ── Replace SL: Cancel + PlaceOrder ───────────────────────────
-        private bool ReplaceSL(Position pos, TrailedPos tp, double newPrice)
-        {
-            try
-            {
-                // Throttle — не спамить биржу
-                if ((DateTime.UtcNow - tp.LastSlUpdate).TotalMilliseconds < 300)
-                    return false;
-                tp.LastSlUpdate = DateTime.UtcNow;
-
-                Side closeSide = tp.IsLong ? Side.Sell : Side.Buy;
-
-                // Отменить старый SL если есть
-                if (!string.IsNullOrEmpty(tp.SlOrderId))
-                    CancelOrder(tp.SlOrderId, pos.Symbol.Name, $"SL(replace) {pos.Side}");
-
-                // Выставить новый SL
-                var result = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
-                {
-                    Symbol = pos.Symbol,
-                    Account = pos.Account,
-                    Side = closeSide,
-                    OrderTypeId = OrderType.Stop,
-                    TriggerPrice = newPrice,
-                    Quantity = pos.Quantity,
-                    TimeInForce = TimeInForce.GTC,
-                    PositionId = pos.Id
-                });
-
-                WriteLog($"[{VERSION}] 📨 [{pos.Symbol.Name}] {pos.Side} ReplaceSL@{newPrice:F6}: {result.Status} {result.Message ?? "OK"} ID:{result.OrderId ?? "null"}");
-
-                if (result.Status != TradingOperationResultStatus.Success)
-                    return false;
-
-                // Обновляем ID сразу — надёжно
-                tp.SlOrderId = result.OrderId;
-                tp.SlPrice = newPrice;
-                return true;
-            }
-            catch (Exception ex)
-            {
-                WriteLog($"[{VERSION}] ❌ ReplaceSL: {ex}");
-                return false;
-            }
-        }
-
-        // ── Найти существующий SL ордер для позиции ───────────────────
+        // ── Найти существующий SL ордер ────────────────────────────────
         private Order FindExistingSlOrder(Position pos)
         {
             Side expectedSide = pos.Side == Side.Buy ? Side.Sell : Side.Buy;
@@ -335,20 +369,9 @@ namespace SafeTrailing
                 if (o.Symbol != pos.Symbol) continue;
                 if (o.Side != expectedSide) continue;
                 if (o.OrderTypeId != OrderType.Stop) continue;
-                return o; // берём первый подходящий
+                return o;
             }
             return null;
-        }
-
-        // ── Отменить ордер ─────────────────────────────────────────────
-        private void CancelOrder(string id, string sym, string label)
-        {
-            if (string.IsNullOrEmpty(id)) return;
-            var order = FindOrder(id);
-            if (order == null) { WriteLog($"[{VERSION}] ℹ [{sym}] {label} ID:{id} не найден."); return; }
-            WriteLog($"[{VERSION}] 📤 [{sym}] Cancel {label} ID:{id}");
-            var r = order.Cancel();
-            WriteLog($"[{VERSION}] 📨 [{sym}] Cancel {label}: {r.Status} {r.Message ?? "OK"}");
         }
 
         private Order FindOrder(string id) { if (string.IsNullOrEmpty(id)) return null; foreach (var o in Core.Instance.Orders) if (o.Id == id) return o; return null; }
@@ -360,11 +383,12 @@ namespace SafeTrailing
             try
             {
                 string name = symbol?.Name ?? "Unknown";
-                string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, $"SafeTrailing_{name}_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.log");
+                string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+                    $"SafeTrailing_{name}_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.log");
                 _logFile = new StreamWriter(path) { AutoFlush = true };
                 WriteLog($"[{VERSION}] 📝 Log: {path}");
             }
-            catch (Exception ex) { Log($"[{VERSION}] ⚠ Log error: {ex.Message}", StrategyLoggingLevel.Error); }
+            catch (Exception ex) { Log($"[{VERSION}] ⚠ Log: {ex.Message}", StrategyLoggingLevel.Error); }
         }
         private void CloseLogFile() { try { _logFile?.Close(); _logFile = null; } catch { } }
         private void WriteLog(string msg, StrategyLoggingLevel lvl = StrategyLoggingLevel.Trading)
